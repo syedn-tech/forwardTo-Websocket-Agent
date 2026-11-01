@@ -24,12 +24,14 @@ irm https://raw.githubusercontent.com/syedn-tech/forwardTo-Websocket-Agent/main/
 Create a `.env` file in your working directory (or use `.env.example` as a template):
 
 ```dotenv
-FORWARDTO_SERVER="https://forwardto.cloud"
 FORWARDTO_TEAM_KEY="fwd_live_xxxxxxxxxxxxxxxx"
 FORWARDTO_CLIENT_ID="cli_xxxxxxxx"
 FORWARDTO_TOKEN="fwd_tok_xxxxxxxxxxxxxxxx"
-TARGET_URL="http://localhost:8000/api/webhook"
+# Optional: only needed if using custom or self-hosted server
+# FORWARDTO_SERVER="https://forwardto.cloud"
 ```
+
+> **Note:** Target forwarding URL is configured directly in your ForwardTo dashboard under Endpoint Settings and syncs dynamically to the agent without requiring restarts.
 
 Then simply start the agent:
 ```bash
@@ -39,11 +41,9 @@ forwardto-agent
 ### 2. Configure via Command-line Flags
 ```bash
 forwardto-agent \
-  -server "https://forwardto.cloud" \
   -key "fwd_live_xxxxxxxx" \
   -client "cli_xxxxxxxx" \
-  -token "fwd_tok_xxxxxxxx" \
-  -target "http://localhost:8000/api/webhook"
+  -token "fwd_tok_xxxxxxxx"
 ```
 
 ---

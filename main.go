@@ -99,7 +99,7 @@ type VerifyResponse struct {
 func main() {
 	loadDotEnv()
 
-	// Resolve default server URL: check FORWARDTO_SERVER, then APP_URL from .env, then fallback
+	// Default server URL: default to forwardto.cloud, but if FORWARDTO_SERVER or APP_URL is in .env / environment, use that
 	defaultServer := getEnv("FORWARDTO_SERVER", getEnv("APP_URL", "https://forwardto.cloud"))
 
 	var (
@@ -107,7 +107,6 @@ func main() {
 		teamKey   = flag.String("team-key", getEnv("FORWARDTO_TEAM_KEY", getEnv("FORWARDTO_TEAM_ID", "")), "ForwardTo Team API Key or Slug (required)")
 		clientID  = flag.String("client-id", getEnv("FORWARDTO_CLIENT_ID", ""), "Client Machine ID registered in ForwardTo (required)")
 		token     = flag.String("token", getEnv("FORWARDTO_TOKEN", ""), "Client Secret Token (required)")
-		overrideTarget = flag.String("target", getEnv("TARGET_URL", ""), "Optional override for local target URL (defaults to server config)")
 	)
 	flag.Parse()
 
@@ -141,17 +140,14 @@ func main() {
 		log.Fatalf("[!] Verification failed: %v", err)
 	}
 
-	// Use target from server, unless user passed explicit local CLI override
+	// Always use target URL configured in ForwardTo
 	activeTarget := strings.TrimSpace(verifyData.Data.Client.TargetURL)
-	if *overrideTarget != "" {
-		activeTarget = strings.TrimSpace(*overrideTarget)
-	}
 
 	if activeTarget == "" {
 		log.Println("--------------------------------------------------")
 		log.Println("[!] ERROR: Target URL is not configured.")
 		log.Printf("    Please configure the Target Forward URL for client '%s'", *clientID)
-		log.Println("    in ForwardTo Endpoint Settings or specify it using --target=http://... or in .env")
+		log.Println("    in ForwardTo Endpoint Settings in your dashboard.")
 		log.Println("--------------------------------------------------")
 		os.Exit(1)
 	}
@@ -160,7 +156,7 @@ func main() {
 	log.Printf("    Team:     %s (ID: %d)", verifyData.Data.Team.Name, verifyData.Data.Team.ID)
 	log.Printf("    Client:   %s", verifyData.Data.Client.ClientID)
 	log.Printf("    Endpoint: /%s", verifyData.Data.Endpoint.Path)
-	log.Printf("    Target:   %s (loaded from ForwardTo server)", activeTarget)
+	log.Printf("    Target:   %s (loaded from ForwardTo)", activeTarget)
 	log.Printf("    Channel:  %s", verifyData.Data.WebSocket.Channel)
 	log.Println("==================================================")
 
