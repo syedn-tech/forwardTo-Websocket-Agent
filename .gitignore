@@ -1,0 +1,12 @@
+# Binaries and executables
+forwardto-agent
+*.exe
+dist/
+
+# Environment files
+.env
+*.local
+
+# OS files
+.DS_Store
+Thumbs.db
