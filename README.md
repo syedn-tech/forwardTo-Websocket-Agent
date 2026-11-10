@@ -23,15 +23,20 @@ irm https://raw.githubusercontent.com/syedn-tech/forwardTo-Websocket-Agent/main/
 ### 1. Configure via Environment File (`.env`)
 Create a `.env` file in your working directory (or use `.env.example` as a template):
 
+**Single Client:**
 ```dotenv
 FORWARDTO_TEAM_KEY="fwd_live_xxxxxxxxxxxxxxxx"
 FORWARDTO_CLIENT_ID="cli_xxxxxxxx"
 FORWARDTO_TOKEN="fwd_tok_xxxxxxxxxxxxxxxx"
-# Optional: only needed if using custom or self-hosted server
-# FORWARDTO_SERVER="https://forwardto.cloud"
 ```
 
-> **Note:** Target forwarding URL is configured directly in your ForwardTo dashboard under Endpoint Settings and syncs dynamically to the agent without requiring restarts.
+**Multiple Clients (One Agent):**
+```dotenv
+FORWARDTO_TEAM_KEY="fwd_live_xxxxxxxxxxxxxxxx"
+FORWARDTO_CLIENTS="billing:fwd_tok_1111, auth:fwd_tok_2222, webhooks:fwd_tok_3333"
+```
+
+> **Note:** Target forwarding URLs and rules are configured directly in your ForwardTo dashboard under Endpoint Settings and sync dynamically to the agent without requiring restarts.
 
 Then simply start the agent:
 ```bash
@@ -39,11 +44,27 @@ forwardto-agent
 ```
 
 ### 2. Configure via Command-line Flags
+
+**Single Client:**
 ```bash
 forwardto-agent \
   --team-key "fwd_live_xxxxxxxx" \
   --client-id "cli_xxxxxxxx" \
   --token "fwd_tok_xxxxxxxx"
+```
+
+**Multiple Clients:**
+```bash
+forwardto-agent \
+  --team-key "fwd_live_xxxxxxxx" \
+  --clients "billing:tok_1111,auth:tok_2222"
+```
+Or via comma-separated IDs and tokens:
+```bash
+forwardto-agent \
+  --team-key "fwd_live_xxxxxxxx" \
+  --client-id "billing,auth" \
+  --token "tok_1111,tok_2222"
 ```
 
 ### 3. Check Version & Self-Update

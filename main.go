@@ -130,9 +130,15 @@ type GitHubRelease struct {
 	} `json:"assets"`
 }
 
-// ConfigHolder safely stores dynamic target URL and active forwarding rules
+type ClientConfig struct {
+	ClientID string
+	Token    string
+}
+
+// ConfigHolder safely stores dynamic target URL and active forwarding rules for a client
 type ConfigHolder struct {
 	mu        sync.RWMutex
+	clientID  string
 	targetURL string
 	rules     []ForwardRule
 }
@@ -163,6 +169,60 @@ func (c *ConfigHolder) SetRules(rules []ForwardRule) {
 	c.rules = rules
 }
 
+func parseClients(clientsFlag, clientIDFlag, tokenFlag string) []ClientConfig {
+	var result []ClientConfig
+	seen := make(map[string]bool)
+
+	// 1. Check clientsFlag (e.g. "billing:tok1, auth:tok2" or "billing, auth")
+	if strings.TrimSpace(clientsFlag) != "" {
+		parts := strings.Split(clientsFlag, ",")
+		for _, part := range parts {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			var id, tok string
+			if strings.Contains(part, ":") {
+				sub := strings.SplitN(part, ":", 2)
+				id = strings.TrimSpace(sub[0])
+				tok = strings.TrimSpace(sub[1])
+			} else {
+				id = part
+			}
+			if id != "" && !seen[id] {
+				seen[id] = true
+				result = append(result, ClientConfig{ClientID: id, Token: tok})
+			}
+		}
+	}
+
+	// 2. Check clientIDFlag and tokenFlag (comma-separated or single)
+	if strings.TrimSpace(clientIDFlag) != "" {
+		ids := strings.Split(clientIDFlag, ",")
+		var toks []string
+		if strings.TrimSpace(tokenFlag) != "" {
+			toks = strings.Split(tokenFlag, ",")
+		}
+
+		for i, rawID := range ids {
+			id := strings.TrimSpace(rawID)
+			if id == "" || seen[id] {
+				continue
+			}
+			var tok string
+			if i < len(toks) {
+				tok = strings.TrimSpace(toks[i])
+			} else if len(toks) == 1 {
+				tok = strings.TrimSpace(toks[0])
+			}
+			seen[id] = true
+			result = append(result, ClientConfig{ClientID: id, Token: tok})
+		}
+	}
+
+	return result
+}
+
 func main() {
 	loadDotEnv()
 
@@ -172,8 +232,9 @@ func main() {
 	var (
 		serverURL   = flag.String("server", defaultServer, "ForwardTo server base URL")
 		teamKey     = flag.String("team-key", getEnv("FORWARDTO_TEAM_KEY", getEnv("FORWARDTO_TEAM_ID", "")), "ForwardTo Team API Key or Slug (required)")
-		clientID    = flag.String("client-id", getEnv("FORWARDTO_CLIENT_ID", ""), "Client Machine ID registered in ForwardTo (required)")
-		token       = flag.String("token", getEnv("FORWARDTO_TOKEN", ""), "Client Secret Token (required)")
+		clientsFlag = flag.String("clients", getEnv("FORWARDTO_CLIENTS", ""), "Comma-separated list of clients in 'client_id:token' or 'client_id' format")
+		clientID    = flag.String("client-id", getEnv("FORWARDTO_CLIENT_ID", ""), "Client Machine ID(s), comma-separated")
+		token       = flag.String("token", getEnv("FORWARDTO_TOKEN", ""), "Client Secret Token(s), comma-separated")
 		checkUpdate = flag.Bool("update", false, "Check for updates and self-update to latest release")
 		showVersion = flag.Bool("version", false, "Print forwardto-agent version")
 	)
@@ -194,22 +255,30 @@ func main() {
 	// Non-blocking background check for latest version on startup
 	go checkLatestVersionNotice()
 
-	// Prompt interactively if missing required flags
+	clients := parseClients(*clientsFlag, *clientID, *token)
+
+	// Prompt interactively if missing required arguments
 	if *teamKey == "" {
 		fmt.Print("Enter Team Key / API Key: ")
 		fmt.Scanln(teamKey)
 	}
-	if *clientID == "" {
+
+	if len(clients) == 0 {
+		var inputID, inputToken string
 		fmt.Print("Enter Client ID: ")
-		fmt.Scanln(clientID)
-	}
-	if *token == "" {
+		fmt.Scanln(&inputID)
 		fmt.Print("Enter Client Secret Token: ")
-		fmt.Scanln(token)
+		fmt.Scanln(&inputToken)
+		if strings.TrimSpace(inputID) != "" {
+			clients = append(clients, ClientConfig{
+				ClientID: strings.TrimSpace(inputID),
+				Token:    strings.TrimSpace(inputToken),
+			})
+		}
 	}
 
-	if *teamKey == "" || *clientID == "" || *token == "" {
-		log.Fatal("ERROR: --team-key, --client-id, and --token are required to start forwardto-agent.")
+	if *teamKey == "" || len(clients) == 0 {
+		log.Fatal("ERROR: --team-key and at least one client (via --client-id/--clients) are required to start forwardto-agent.")
 	}
 
 	cleanServerURL := strings.TrimRight(*serverURL, "/")
@@ -217,56 +286,7 @@ func main() {
 	log.Println("==================================================")
 	log.Printf("           FORWARDTO RELAY AGENT (v%s)           \n", Version)
 	log.Println("==================================================")
-	log.Printf("[*] Verifying client '%s' on %s...", *clientID, cleanServerURL)
-
-	verifyData, err := verifyCredentials(cleanServerURL, *teamKey, *clientID, *token)
-	if err != nil {
-		log.Fatalf("[!] Verification failed: %v", err)
-	}
-
-	// Default target URL configured in ForwardTo
-	activeTarget := strings.TrimSpace(verifyData.Data.Client.TargetURL)
-
-	if activeTarget == "" {
-		log.Println("--------------------------------------------------")
-		log.Println("[!] ERROR: Default Target URL is not configured.")
-		log.Printf("    Please configure the Target Forward URL for client '%s'", *clientID)
-		log.Println("    in ForwardTo Endpoint Settings in your dashboard.")
-		log.Println("--------------------------------------------------")
-		os.Exit(1)
-	}
-
-	configHolder := &ConfigHolder{
-		targetURL: activeTarget,
-		rules:     verifyData.Data.Rules,
-	}
-
-	log.Printf("[✓] Verified successfully!")
-	log.Printf("    Team:         %s (ID: %d)", verifyData.Data.Team.Name, verifyData.Data.Team.ID)
-	log.Printf("    Client:       %s", verifyData.Data.Client.ClientID)
-	log.Printf("    Endpoint:     /%s", verifyData.Data.Endpoint.Path)
-	log.Printf("    Default URL:  %s", activeTarget)
-	log.Printf("    Active Rules: %d loaded", len(verifyData.Data.Rules))
-	log.Printf("    Channel:      %s", verifyData.Data.WebSocket.Channel)
-	log.Println("==================================================")
-
-	wsScheme := verifyData.Data.WebSocket.Scheme
-	if wsScheme == "https" {
-		wsScheme = "wss"
-	} else if wsScheme == "http" {
-		wsScheme = "ws"
-	}
-	wsHost := verifyData.Data.WebSocket.Host
-	wsPort := verifyData.Data.WebSocket.Port
-	appKey := verifyData.Data.WebSocket.AppKey
-	channel := verifyData.Data.WebSocket.Channel
-
-	var wsURL string
-	if (wsScheme == "wss" && wsPort == "443") || (wsScheme == "ws" && wsPort == "80") || wsPort == "" {
-		wsURL = fmt.Sprintf("%s://%s/app/%s?protocol=7&client=js&version=8.4.0-reverb&flash=false", wsScheme, wsHost, appKey)
-	} else {
-		wsURL = fmt.Sprintf("%s://%s:%s/app/%s?protocol=7&client=js&version=8.4.0-reverb&flash=false", wsScheme, wsHost, wsPort, appKey)
-	}
+	log.Printf("[*] Initializing %d client worker(s)...", len(clients))
 
 	// Listen for Ctrl+C (SIGINT) and SIGTERM in a background listener that exits cleanly immediately
 	interrupt := make(chan os.Signal, 1)
@@ -277,14 +297,74 @@ func main() {
 		os.Exit(0)
 	}()
 
+	var wg sync.WaitGroup
+
+	for _, client := range clients {
+		wg.Add(1)
+		go func(cfg ClientConfig) {
+			defer wg.Done()
+			runClientWorker(cleanServerURL, *teamKey, cfg)
+		}(client)
+	}
+
+	wg.Wait()
+}
+
+func runClientWorker(serverURL, teamKey string, cfg ClientConfig) {
+	prefix := fmt.Sprintf("[%s]", cfg.ClientID)
+	log.Printf("%s Verifying credentials on %s...", prefix, serverURL)
+
 	for {
-		log.Printf("[*] Connecting to WebSocket: %s://%s...", wsScheme, wsHost)
-		err := runWebSocket(cleanServerURL, *token, wsURL, channel, configHolder)
+		verifyData, err := verifyCredentials(serverURL, teamKey, cfg.ClientID, cfg.Token)
 		if err != nil {
-			log.Printf("[!] Disconnected: %v. Reconnecting in 5s...", err)
-			time.Sleep(5 * time.Second)
+			log.Printf("%s [!] Verification failed: %v. Retrying in 10s...", prefix, err)
+			time.Sleep(10 * time.Second)
+			continue
+		}
+
+		activeTarget := strings.TrimSpace(verifyData.Data.Client.TargetURL)
+		if activeTarget == "" {
+			log.Printf("%s [!] ERROR: Target URL is not configured in dashboard. Retrying in 15s...", prefix)
+			time.Sleep(15 * time.Second)
+			continue
+		}
+
+		configHolder := &ConfigHolder{
+			clientID:  cfg.ClientID,
+			targetURL: activeTarget,
+			rules:     verifyData.Data.Rules,
+		}
+
+		log.Printf("%s [✓] Verified! Endpoint: /%s | Default URL: %s | Rules: %d",
+			prefix,
+			verifyData.Data.Endpoint.Path,
+			activeTarget,
+			len(verifyData.Data.Rules),
+		)
+
+		wsScheme := verifyData.Data.WebSocket.Scheme
+		if wsScheme == "https" {
+			wsScheme = "wss"
+		} else if wsScheme == "http" {
+			wsScheme = "ws"
+		}
+		wsHost := verifyData.Data.WebSocket.Host
+		wsPort := verifyData.Data.WebSocket.Port
+		appKey := verifyData.Data.WebSocket.AppKey
+		channel := verifyData.Data.WebSocket.Channel
+
+		var wsURL string
+		if (wsScheme == "wss" && wsPort == "443") || (wsScheme == "ws" && wsPort == "80") || wsPort == "" {
+			wsURL = fmt.Sprintf("%s://%s/app/%s?protocol=7&client=js&version=8.4.0-reverb&flash=false", wsScheme, wsHost, appKey)
 		} else {
-			return
+			wsURL = fmt.Sprintf("%s://%s:%s/app/%s?protocol=7&client=js&version=8.4.0-reverb&flash=false", wsScheme, wsHost, wsPort, appKey)
+		}
+
+		log.Printf("%s Connecting to WebSocket: %s://%s (channel: %s)...", prefix, wsScheme, wsHost, channel)
+		err = runWebSocket(serverURL, cfg.Token, wsURL, channel, configHolder)
+		if err != nil {
+			log.Printf("%s [!] Disconnected: %v. Reconnecting in 5s...", prefix, err)
+			time.Sleep(5 * time.Second)
 		}
 	}
 }
@@ -340,6 +420,8 @@ func verifyCredentials(serverURL, teamKey, clientID, token string) (*VerifyRespo
 }
 
 func runWebSocket(serverURL, token, wsURL, channel string, configHolder *ConfigHolder) error {
+	prefix := fmt.Sprintf("[%s]", configHolder.clientID)
+
 	u, err := url.Parse(wsURL)
 	if err != nil {
 		return err
@@ -358,7 +440,7 @@ func runWebSocket(serverURL, token, wsURL, channel string, configHolder *ConfigH
 	}
 	defer conn.Close()
 
-	log.Printf("[✓] Connected to WebSocket! Subscribing to channel '%s'...", channel)
+	log.Printf("%s [✓] Connected to WebSocket! Subscribed to '%s'", prefix, channel)
 
 	subscribeMsg := map[string]interface{}{
 		"event": "pusher:subscribe",
@@ -381,7 +463,7 @@ func runWebSocket(serverURL, token, wsURL, channel string, configHolder *ConfigH
 		for {
 			_, msg, err := conn.ReadMessage()
 			if err != nil {
-				log.Printf("[!] Read error: %v", err)
+				log.Printf("%s [!] Read error: %v", prefix, err)
 				return
 			}
 
@@ -414,13 +496,13 @@ func runWebSocket(serverURL, token, wsURL, channel string, configHolder *ConfigH
 
 				if systemCheck.SystemEvent == "client.config_updated" && systemCheck.TargetURL != "" {
 					configHolder.SetTargetURL(systemCheck.TargetURL)
-					log.Printf("[⟳ CONFIG UPDATED] Default target URL updated on-the-fly to: %s", systemCheck.TargetURL)
+					log.Printf("%s [⟳ CONFIG UPDATED] Target URL updated on-the-fly to: %s", prefix, systemCheck.TargetURL)
 					continue
 				}
 
 				if systemCheck.SystemEvent == "rules.updated" {
 					configHolder.SetRules(systemCheck.Rules)
-					log.Printf("[⟳ RULES UPDATED] Forwarding rules synchronized (%d active rules)", len(systemCheck.Rules))
+					log.Printf("%s [⟳ RULES UPDATED] Forwarding rules synchronized (%d active rules)", prefix, len(systemCheck.Rules))
 					continue
 				}
 
@@ -442,7 +524,7 @@ func runWebSocket(serverURL, token, wsURL, channel string, configHolder *ConfigH
 				defaultTarget := configHolder.GetTargetURL()
 
 				// Forward locally in a non-blocking goroutine so WebSocket loop has 0ms latency
-				go forwardLocally(serverURL, token, defaultTarget, payload, matchedRule)
+				go forwardLocally(serverURL, token, configHolder.clientID, defaultTarget, payload, matchedRule)
 			}
 		}
 	}()
@@ -620,7 +702,8 @@ func evaluateCondition(actual interface{}, expected *string, separator *string) 
 	return fmt.Sprintf("%v", actual) == expectedStr
 }
 
-func forwardLocally(serverURL, token, defaultTarget string, payload WebhookPayload, matchedRule *ForwardRule) {
+func forwardLocally(serverURL, token, clientID, defaultTarget string, payload WebhookPayload, matchedRule *ForwardRule) {
+	prefix := fmt.Sprintf("[%s]", clientID)
 	destinationURL := defaultTarget
 	method := payload.Method
 	var ruleID *int64
@@ -642,7 +725,7 @@ func forwardLocally(serverURL, token, defaultTarget string, payload WebhookPaylo
 
 	req, err := http.NewRequest(method, destinationURL, bytes.NewBuffer(payload.Body))
 	if err != nil {
-		log.Printf("[!] Local request construction failed: %v", err)
+		log.Printf("%s [!] Local request construction failed: %v", prefix, err)
 		go reportDelivery(serverURL, token, payload.RequestID, ruleID, "FAILED", 0, destinationURL, method, "", fmt.Sprintf("Request build failed: %v", err))
 		return
 	}
@@ -664,12 +747,12 @@ func forwardLocally(serverURL, token, defaultTarget string, payload WebhookPaylo
 		}
 	}
 
-	req.Header.Set("X-ForwardTo-Relay", "forwardto-agent")
+	req.Header.Set("X-ForwardTo-Relay", fmt.Sprintf("forwardto-agent: %s", clientID))
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("[!] Dispatch to %s failed: %v", destinationURL, err)
+		log.Printf("%s [!] Dispatch to %s failed: %v", prefix, destinationURL, err)
 		go reportDelivery(serverURL, token, payload.RequestID, ruleID, "FAILED", 0, destinationURL, method, "", fmt.Sprintf("Dispatch failed: %v", err))
 		return
 	}
@@ -693,7 +776,7 @@ func forwardLocally(serverURL, token, defaultTarget string, payload WebhookPaylo
 		matchedNotice = " [Default Target]"
 	}
 
-	log.Printf("[✓ DELIVERED] HTTP %d <- %s (req #%d)%s", resp.StatusCode, destinationURL, payload.RequestID, matchedNotice)
+	log.Printf("%s [✓ DELIVERED] HTTP %d <- %s (req #%d)%s", prefix, resp.StatusCode, destinationURL, payload.RequestID, matchedNotice)
 
 	// Asynchronously notify ForwardTo of delivery receipt so user sees it in the dashboard UI
 	go reportDelivery(serverURL, token, payload.RequestID, ruleID, status, resp.StatusCode, destinationURL, method, respStr, "")
