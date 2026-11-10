@@ -41,16 +41,27 @@ forwardto-agent
 ### 2. Configure via Command-line Flags
 ```bash
 forwardto-agent \
-  -key "fwd_live_xxxxxxxx" \
-  -client "cli_xxxxxxxx" \
-  -token "fwd_tok_xxxxxxxx"
+  --team-key "fwd_live_xxxxxxxx" \
+  --client-id "cli_xxxxxxxx" \
+  --token "fwd_tok_xxxxxxxx"
+```
+
+### 3. Check Version & Self-Update
+```bash
+# Check installed version
+forwardto-agent --version
+
+# Auto-update binary in-place to the latest release
+forwardto-agent --update
 ```
 
 ---
 
 ## ✨ Features
 - **Outbound Only**: Connects outwards to ForwardTo via secure WebSocket (`wss://`). No public IP or open ingress ports needed.
-- **Dynamic Config**: Updates to the target forwarding URL on the ForwardTo dashboard are applied instantly over WebSocket without agent restarts.
+- **Rule-Based Routing**: If an incoming webhook matches forwarding rules defined in your ForwardTo dashboard, it automatically dispatches to the matched rule's URL. If no rules match, it forwards to your client's default target URL.
+- **Dynamic Config**: Updates to the default target URL on the ForwardTo dashboard are applied instantly over WebSocket without agent restarts.
+- **In-Place Self-Updating**: Automatically detects new releases on startup and can self-update in place via `forwardto-agent --update`.
 - **Real-Time Delivery Logging**: Dispatches requests to your local target and asynchronously reports status code and latency back to your ForwardTo workspace.
 - **Zero Dependencies**: Single standalone compiled Go binary.
 - **Graceful Shutdown**: Instant clean exit on `Ctrl+C`.

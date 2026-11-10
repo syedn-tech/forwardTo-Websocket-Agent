@@ -13,11 +13,22 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
+)
+
+// Version is injected via -ldflags during build/release or defaults to local dev
+var Version = "0.1.0"
+
+const (
+	githubOwner = "syedn-tech"
+	githubRepo  = "forwardTo-Websocket-Agent"
 )
 
 // loadDotEnv attempts to read key=value pairs from a local .env file if it exists.
@@ -61,6 +72,8 @@ type WebhookPayload struct {
 	RequestID  int64               `json:"request_id"`
 	Endpoint   string              `json:"endpoint"`
 	Method     string              `json:"method"`
+	TargetURL  string              `json:"target_url,omitempty"` // Matched rule target URL, if any
+	RuleID     *int64              `json:"rule_id,omitempty"`
 	Headers    map[string][]string `json:"headers"`
 	Query      map[string]string   `json:"query"`
 	Body       json.RawMessage     `json:"body"`
@@ -96,6 +109,15 @@ type VerifyResponse struct {
 	} `json:"data"`
 }
 
+type GitHubRelease struct {
+	TagName string `json:"tag_name"`
+	Name    string `json:"name"`
+	Assets  []struct {
+		Name               string `json:"name"`
+		BrowserDownloadURL string `json:"browser_download_url"`
+	} `json:"assets"`
+}
+
 func main() {
 	loadDotEnv()
 
@@ -103,12 +125,29 @@ func main() {
 	defaultServer := getEnv("FORWARDTO_SERVER", getEnv("APP_URL", "https://forwardto.cloud"))
 
 	var (
-		serverURL = flag.String("server", defaultServer, "ForwardTo server base URL")
-		teamKey   = flag.String("team-key", getEnv("FORWARDTO_TEAM_KEY", getEnv("FORWARDTO_TEAM_ID", "")), "ForwardTo Team API Key or Slug (required)")
-		clientID  = flag.String("client-id", getEnv("FORWARDTO_CLIENT_ID", ""), "Client Machine ID registered in ForwardTo (required)")
-		token     = flag.String("token", getEnv("FORWARDTO_TOKEN", ""), "Client Secret Token (required)")
+		serverURL   = flag.String("server", defaultServer, "ForwardTo server base URL")
+		teamKey     = flag.String("team-key", getEnv("FORWARDTO_TEAM_KEY", getEnv("FORWARDTO_TEAM_ID", "")), "ForwardTo Team API Key or Slug (required)")
+		clientID    = flag.String("client-id", getEnv("FORWARDTO_CLIENT_ID", ""), "Client Machine ID registered in ForwardTo (required)")
+		token       = flag.String("token", getEnv("FORWARDTO_TOKEN", ""), "Client Secret Token (required)")
+		checkUpdate = flag.Bool("update", false, "Check for updates and self-update to latest release")
+		showVersion = flag.Bool("version", false, "Print forwardto-agent version")
 	)
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("forwardto-agent %s (%s/%s)\n", Version, runtime.GOOS, runtime.GOARCH)
+		return
+	}
+
+	if *checkUpdate {
+		if err := executeSelfUpdate(true); err != nil {
+			log.Fatalf("[!] Update failed: %v", err)
+		}
+		return
+	}
+
+	// Non-blocking background check for latest version on startup
+	go checkLatestVersionNotice()
 
 	// Prompt interactively if missing required flags
 	if *teamKey == "" {
@@ -131,7 +170,7 @@ func main() {
 	cleanServerURL := strings.TrimRight(*serverURL, "/")
 
 	log.Println("==================================================")
-	log.Println("               FORWARDTO RELAY AGENT              ")
+	log.Printf("           FORWARDTO RELAY AGENT (v%s)           \n", Version)
 	log.Println("==================================================")
 	log.Printf("[*] Verifying client '%s' on %s...", *clientID, cleanServerURL)
 
@@ -140,12 +179,12 @@ func main() {
 		log.Fatalf("[!] Verification failed: %v", err)
 	}
 
-	// Always use target URL configured in ForwardTo
+	// Default target URL configured in ForwardTo
 	activeTarget := strings.TrimSpace(verifyData.Data.Client.TargetURL)
 
 	if activeTarget == "" {
 		log.Println("--------------------------------------------------")
-		log.Println("[!] ERROR: Target URL is not configured.")
+		log.Println("[!] ERROR: Default Target URL is not configured.")
 		log.Printf("    Please configure the Target Forward URL for client '%s'", *clientID)
 		log.Println("    in ForwardTo Endpoint Settings in your dashboard.")
 		log.Println("--------------------------------------------------")
@@ -156,7 +195,7 @@ func main() {
 	log.Printf("    Team:     %s (ID: %d)", verifyData.Data.Team.Name, verifyData.Data.Team.ID)
 	log.Printf("    Client:   %s", verifyData.Data.Client.ClientID)
 	log.Printf("    Endpoint: /%s", verifyData.Data.Endpoint.Path)
-	log.Printf("    Target:   %s (loaded from ForwardTo)", activeTarget)
+	log.Printf("    Target:   %s (default)", activeTarget)
 	log.Printf("    Channel:  %s", verifyData.Data.WebSocket.Channel)
 	log.Println("==================================================")
 
@@ -337,7 +376,7 @@ func runWebSocket(serverURL, token, wsURL, channel string, targetHolder *TargetH
 
 				if systemCheck.SystemEvent == "client.config_updated" && systemCheck.TargetURL != "" {
 					targetHolder.Set(systemCheck.TargetURL)
-					log.Printf("[⟳ CONFIG UPDATED] Target URL updated on-the-fly to: %s", systemCheck.TargetURL)
+					log.Printf("[⟳ CONFIG UPDATED] Default target URL updated on-the-fly to: %s", systemCheck.TargetURL)
 					continue
 				}
 
@@ -351,8 +390,18 @@ func runWebSocket(serverURL, token, wsURL, channel string, targetHolder *TargetH
 					_ = json.Unmarshal(env.Data, &payload)
 				}
 
+				// Priority:
+				// 1. Matched rule target URL (if rule was triggered on ForwardTo)
+				// 2. Default client target URL (from dashboard)
+				resolvedTarget := strings.TrimSpace(payload.TargetURL)
+				isRuleMatched := resolvedTarget != ""
+
+				if !isRuleMatched {
+					resolvedTarget = targetHolder.Get()
+				}
+
 				// Forward locally in a non-blocking goroutine so WebSocket loop has 0ms latency
-				go forwardLocally(serverURL, token, targetHolder.Get(), payload)
+				go forwardLocally(serverURL, token, resolvedTarget, payload, isRuleMatched)
 			}
 		}
 	}()
@@ -369,7 +418,7 @@ func runWebSocket(serverURL, token, wsURL, channel string, targetHolder *TargetH
 	}
 }
 
-func forwardLocally(serverURL, token, targetURL string, payload WebhookPayload) {
+func forwardLocally(serverURL, token, targetURL string, payload WebhookPayload, isRuleMatched bool) {
 	method := payload.Method
 	if method == "" {
 		method = "POST"
@@ -412,7 +461,18 @@ func forwardLocally(serverURL, token, targetURL string, payload WebhookPayload) 
 		status = "FAILED"
 	}
 
-	log.Printf("[✓ DELIVERED] HTTP %d <- %s (req #%d)", resp.StatusCode, targetURL, payload.RequestID)
+	matchedNotice := ""
+	if isRuleMatched {
+		if payload.RuleID != nil {
+			matchedNotice = fmt.Sprintf(" [Rule #%d]", *payload.RuleID)
+		} else {
+			matchedNotice = " [Matched Rule]"
+		}
+	} else {
+		matchedNotice = " [Default Target]"
+	}
+
+	log.Printf("[✓ DELIVERED] HTTP %d <- %s (req #%d)%s", resp.StatusCode, targetURL, payload.RequestID, matchedNotice)
 
 	// Asynchronously notify ForwardTo of delivery receipt so user sees it in the dashboard UI
 	go reportDelivery(serverURL, token, payload.RequestID, status, resp.StatusCode, targetURL, method, respStr, "")
@@ -461,4 +521,188 @@ func getEnv(key, fallback string) string {
 		return val
 	}
 	return fallback
+}
+
+// -------------------------------------------------------------------------
+// Self-update and version checking logic
+// -------------------------------------------------------------------------
+
+func fetchLatestRelease() (*GitHubRelease, error) {
+	client := &http.Client{Timeout: 8 * time.Second}
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", githubOwner, githubRepo)
+
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "forwardto-agent/"+Version)
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GitHub API returned HTTP %d", resp.StatusCode)
+	}
+
+	var rel GitHubRelease
+	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+		return nil, err
+	}
+	return &rel, nil
+}
+
+func parseSemVer(v string) (major, minor, patch int) {
+	v = strings.TrimPrefix(strings.TrimSpace(v), "v")
+	parts := strings.Split(v, ".")
+	if len(parts) > 0 {
+		major, _ = strconv.Atoi(parts[0])
+	}
+	if len(parts) > 1 {
+		minor, _ = strconv.Atoi(parts[1])
+	}
+	if len(parts) > 2 {
+		patchParts := strings.Split(parts[2], "-")
+		patch, _ = strconv.Atoi(patchParts[0])
+	}
+	return
+}
+
+func isNewerVersion(latest, current string) bool {
+	lMaj, lMin, lPatch := parseSemVer(latest)
+	cMaj, cMin, cPatch := parseSemVer(current)
+
+	if lMaj != cMaj {
+		return lMaj > cMaj
+	}
+	if lMin != cMin {
+		return lMin > cMin
+	}
+	return lPatch > cPatch
+}
+
+// checkLatestVersionNotice prints a notification banner if a newer version is available
+func checkLatestVersionNotice() {
+	rel, err := fetchLatestRelease()
+	if err != nil {
+		return
+	}
+
+	if isNewerVersion(rel.TagName, Version) {
+		log.Println("------------------------------------------------------------------")
+		log.Printf("[!] A newer version of forwardto-agent is available: %s (current: v%s)", rel.TagName, Version)
+		log.Println("    To auto-update immediately, run:")
+		log.Println("      forwardto-agent --update")
+		log.Println("    Or re-run the installer:")
+		log.Println("      curl -sSL https://forwardto.cloud/install.sh | bash")
+		log.Println("------------------------------------------------------------------")
+	}
+}
+
+// executeSelfUpdate performs an in-place download and binary replacement
+func executeSelfUpdate(verbose bool) error {
+	if verbose {
+		fmt.Printf("[*] Checking for updates (current version: v%s)...\n", Version)
+	}
+
+	rel, err := fetchLatestRelease()
+	if err != nil {
+		return fmt.Errorf("failed to check latest release: %w", err)
+	}
+
+	if !isNewerVersion(rel.TagName, Version) {
+		if verbose {
+			fmt.Printf("[✓] forwardto-agent is already up to date (%s).\n", Version)
+		}
+		return nil
+	}
+
+	fmt.Printf("[*] Found newer version: %s. Locating asset for %s/%s...\n", rel.TagName, runtime.GOOS, runtime.GOARCH)
+
+	expectedAssetName := fmt.Sprintf("forwardto-agent-%s-%s", runtime.GOOS, runtime.GOARCH)
+	if runtime.GOOS == "windows" {
+		expectedAssetName += ".exe"
+	}
+
+	var downloadURL string
+	for _, asset := range rel.Assets {
+		if strings.EqualFold(asset.Name, expectedAssetName) {
+			downloadURL = asset.BrowserDownloadURL
+			break
+		}
+	}
+
+	if downloadURL == "" {
+		return fmt.Errorf("release %s does not contain a binary matching %s", rel.TagName, expectedAssetName)
+	}
+
+	fmt.Printf("[*] Downloading %s from %s...\n", expectedAssetName, downloadURL)
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Get(downloadURL)
+	if err != nil {
+		return fmt.Errorf("download error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to download: HTTP %d", resp.StatusCode)
+	}
+
+	exePath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("failed to determine executable path: %w", err)
+	}
+	exePath, err = filepath.EvalSymlinks(exePath)
+	if err != nil {
+		return fmt.Errorf("failed to resolve symlink: %w", err)
+	}
+
+	if err := applyUpdate(exePath, resp.Body); err != nil {
+		return fmt.Errorf("failed to apply binary update: %w", err)
+	}
+
+	fmt.Printf("[✓] Successfully updated forwardto-agent to %s!\n", rel.TagName)
+	fmt.Printf("    Updated executable location: %s\n", exePath)
+	return nil
+}
+
+// applyUpdate replaces the binary at exePath safely and atomically
+func applyUpdate(exePath string, r io.Reader) error {
+	dir := filepath.Dir(exePath)
+	tmpFile, err := os.CreateTemp(dir, "forwardto-agent-update-*")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary file in %s: %w", dir, err)
+	}
+	tmpName := tmpFile.Name()
+	defer os.Remove(tmpName)
+
+	if _, err := io.Copy(tmpFile, r); err != nil {
+		tmpFile.Close()
+		return fmt.Errorf("failed to write update binary: %w", err)
+	}
+	tmpFile.Close()
+
+	if err := os.Chmod(tmpName, 0755); err != nil {
+		return fmt.Errorf("failed to set executable permissions: %w", err)
+	}
+
+	oldPath := exePath + ".old"
+	_ = os.Remove(oldPath)
+
+	if err := os.Rename(exePath, oldPath); err != nil {
+		return fmt.Errorf("failed to move existing binary (check file permissions or run with sudo): %w", err)
+	}
+
+	if err := os.Rename(tmpName, exePath); err != nil {
+		// Rollback if replacement failed
+		_ = os.Rename(oldPath, exePath)
+		return fmt.Errorf("failed to replace binary: %w", err)
+	}
+
+	_ = os.Remove(oldPath)
+	return nil
 }

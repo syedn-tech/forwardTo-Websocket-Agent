@@ -24,16 +24,19 @@ jobs:
         working-directory: .
         run: |
           mkdir -p dist
+          TAG_VERSION=${GITHUB_REF_NAME#v}
+          LDFLAGS="-s -w -X main.Version=${TAG_VERSION}"
+
           # Linux AMD64 & ARM64
-          GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o dist/forwardto-agent-linux-amd64 main.go
-          GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o dist/forwardto-agent-linux-arm64 main.go
+          GOOS=linux GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o dist/forwardto-agent-linux-amd64 main.go
+          GOOS=linux GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o dist/forwardto-agent-linux-arm64 main.go
           
           # macOS Intel & Apple Silicon
-          GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o dist/forwardto-agent-darwin-amd64 main.go
-          GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o dist/forwardto-agent-darwin-arm64 main.go
+          GOOS=darwin GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o dist/forwardto-agent-darwin-amd64 main.go
+          GOOS=darwin GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o dist/forwardto-agent-darwin-arm64 main.go
           
           # Windows AMD64
-          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o dist/forwardto-agent-windows-amd64.exe main.go
+          GOOS=windows GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o dist/forwardto-agent-windows-amd64.exe main.go
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
