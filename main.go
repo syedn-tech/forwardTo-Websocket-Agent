@@ -25,7 +25,7 @@ import (
 )
 
 // Version is injected via -ldflags during build/release or defaults to local dev
-var Version = "0.2.0"
+var Version = "0.2.1"
 
 const (
 	githubOwner = "syedn-tech"
