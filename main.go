@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -24,7 +25,7 @@ import (
 )
 
 // Version is injected via -ldflags during build/release or defaults to local dev
-var Version = "0.1.0"
+var Version = "0.2.0"
 
 const (
 	githubOwner = "syedn-tech"
@@ -68,12 +69,22 @@ type PusherEnvelope struct {
 	Channel string          `json:"channel,omitempty"`
 }
 
+type ForwardRule struct {
+	ID                 int64             `json:"id"`
+	Type               string            `json:"type"` // HTTP Method (GET, POST, PUT, etc.)
+	URL                string            `json:"url"`  // Forward target URL
+	ParameterType      *string           `json:"parameter_type"`
+	ConditionKey       *string           `json:"condition_key"`
+	ConditionSeperator *string           `json:"condition_seperator"`
+	ConditionValue     *string           `json:"condition_value"`
+	Headers            map[string]string `json:"headers"`
+	Active             bool              `json:"active"`
+}
+
 type WebhookPayload struct {
 	RequestID  int64               `json:"request_id"`
 	Endpoint   string              `json:"endpoint"`
 	Method     string              `json:"method"`
-	TargetURL  string              `json:"target_url,omitempty"` // Matched rule target URL, if any
-	RuleID     *int64              `json:"rule_id,omitempty"`
 	Headers    map[string][]string `json:"headers"`
 	Query      map[string]string   `json:"query"`
 	Body       json.RawMessage     `json:"body"`
@@ -99,6 +110,7 @@ type VerifyResponse struct {
 			ID   int    `json:"id"`
 			Path string `json:"path"`
 		} `json:"endpoint"`
+		Rules     []ForwardRule `json:"rules"`
 		WebSocket struct {
 			Host    string `json:"host"`
 			Port    string `json:"port"`
@@ -116,6 +128,39 @@ type GitHubRelease struct {
 		Name               string `json:"name"`
 		BrowserDownloadURL string `json:"browser_download_url"`
 	} `json:"assets"`
+}
+
+// ConfigHolder safely stores dynamic target URL and active forwarding rules
+type ConfigHolder struct {
+	mu        sync.RWMutex
+	targetURL string
+	rules     []ForwardRule
+}
+
+func (c *ConfigHolder) GetTargetURL() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.targetURL
+}
+
+func (c *ConfigHolder) SetTargetURL(url string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.targetURL = url
+}
+
+func (c *ConfigHolder) GetRules() []ForwardRule {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	copied := make([]ForwardRule, len(c.rules))
+	copy(copied, c.rules)
+	return copied
+}
+
+func (c *ConfigHolder) SetRules(rules []ForwardRule) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rules = rules
 }
 
 func main() {
@@ -191,12 +236,18 @@ func main() {
 		os.Exit(1)
 	}
 
+	configHolder := &ConfigHolder{
+		targetURL: activeTarget,
+		rules:     verifyData.Data.Rules,
+	}
+
 	log.Printf("[✓] Verified successfully!")
-	log.Printf("    Team:     %s (ID: %d)", verifyData.Data.Team.Name, verifyData.Data.Team.ID)
-	log.Printf("    Client:   %s", verifyData.Data.Client.ClientID)
-	log.Printf("    Endpoint: /%s", verifyData.Data.Endpoint.Path)
-	log.Printf("    Target:   %s (default)", activeTarget)
-	log.Printf("    Channel:  %s", verifyData.Data.WebSocket.Channel)
+	log.Printf("    Team:         %s (ID: %d)", verifyData.Data.Team.Name, verifyData.Data.Team.ID)
+	log.Printf("    Client:       %s", verifyData.Data.Client.ClientID)
+	log.Printf("    Endpoint:     /%s", verifyData.Data.Endpoint.Path)
+	log.Printf("    Default URL:  %s", activeTarget)
+	log.Printf("    Active Rules: %d loaded", len(verifyData.Data.Rules))
+	log.Printf("    Channel:      %s", verifyData.Data.WebSocket.Channel)
 	log.Println("==================================================")
 
 	wsScheme := verifyData.Data.WebSocket.Scheme
@@ -226,11 +277,9 @@ func main() {
 		os.Exit(0)
 	}()
 
-	targetHolder := &TargetHolder{URL: activeTarget}
-
 	for {
 		log.Printf("[*] Connecting to WebSocket: %s://%s...", wsScheme, wsHost)
-		err := runWebSocket(cleanServerURL, *token, wsURL, channel, targetHolder)
+		err := runWebSocket(cleanServerURL, *token, wsURL, channel, configHolder)
 		if err != nil {
 			log.Printf("[!] Disconnected: %v. Reconnecting in 5s...", err)
 			time.Sleep(5 * time.Second)
@@ -238,18 +287,6 @@ func main() {
 			return
 		}
 	}
-}
-
-type TargetHolder struct {
-	URL string
-}
-
-func (t *TargetHolder) Get() string {
-	return t.URL
-}
-
-func (t *TargetHolder) Set(newURL string) {
-	t.URL = newURL
 }
 
 func verifyCredentials(serverURL, teamKey, clientID, token string) (*VerifyResponse, error) {
@@ -302,7 +339,7 @@ func verifyCredentials(serverURL, teamKey, clientID, token string) (*VerifyRespo
 	return &res, nil
 }
 
-func runWebSocket(serverURL, token, wsURL, channel string, targetHolder *TargetHolder) error {
+func runWebSocket(serverURL, token, wsURL, channel string, configHolder *ConfigHolder) error {
 	u, err := url.Parse(wsURL)
 	if err != nil {
 		return err
@@ -359,10 +396,11 @@ func runWebSocket(serverURL, token, wsURL, channel string, targetHolder *TargetH
 			}
 
 			if env.Event == "webhook.received" || strings.HasSuffix(env.Event, "WebhookReceived") {
-				// Check if it's a dynamic config update from ForwardTo server
+				// 1. Check for dynamic config/rules updates
 				var systemCheck struct {
-					SystemEvent string `json:"_system_event"`
-					TargetURL   string `json:"target_url"`
+					SystemEvent string        `json:"_system_event"`
+					TargetURL   string        `json:"target_url"`
+					Rules       []ForwardRule `json:"rules"`
 				}
 
 				if len(env.Data) > 0 && env.Data[0] == '"' {
@@ -375,11 +413,18 @@ func runWebSocket(serverURL, token, wsURL, channel string, targetHolder *TargetH
 				}
 
 				if systemCheck.SystemEvent == "client.config_updated" && systemCheck.TargetURL != "" {
-					targetHolder.Set(systemCheck.TargetURL)
+					configHolder.SetTargetURL(systemCheck.TargetURL)
 					log.Printf("[⟳ CONFIG UPDATED] Default target URL updated on-the-fly to: %s", systemCheck.TargetURL)
 					continue
 				}
 
+				if systemCheck.SystemEvent == "rules.updated" {
+					configHolder.SetRules(systemCheck.Rules)
+					log.Printf("[⟳ RULES UPDATED] Forwarding rules synchronized (%d active rules)", len(systemCheck.Rules))
+					continue
+				}
+
+				// 2. Parse incoming webhook payload
 				var payload WebhookPayload
 				if len(env.Data) > 0 && env.Data[0] == '"' {
 					var unquoted string
@@ -390,18 +435,14 @@ func runWebSocket(serverURL, token, wsURL, channel string, targetHolder *TargetH
 					_ = json.Unmarshal(env.Data, &payload)
 				}
 
-				// Priority:
-				// 1. Matched rule target URL (if rule was triggered on ForwardTo)
-				// 2. Default client target URL (from dashboard)
-				resolvedTarget := strings.TrimSpace(payload.TargetURL)
-				isRuleMatched := resolvedTarget != ""
+				// 3. Client-side Rule Matching
+				rules := configHolder.GetRules()
+				matchedRule := matchRuleLocally(rules, payload)
 
-				if !isRuleMatched {
-					resolvedTarget = targetHolder.Get()
-				}
+				defaultTarget := configHolder.GetTargetURL()
 
 				// Forward locally in a non-blocking goroutine so WebSocket loop has 0ms latency
-				go forwardLocally(serverURL, token, resolvedTarget, payload, isRuleMatched)
+				go forwardLocally(serverURL, token, defaultTarget, payload, matchedRule)
 			}
 		}
 	}()
@@ -418,19 +459,195 @@ func runWebSocket(serverURL, token, wsURL, channel string, targetHolder *TargetH
 	}
 }
 
-func forwardLocally(serverURL, token, targetURL string, payload WebhookPayload, isRuleMatched bool) {
+// matchRuleLocally evaluates client-side rules against the incoming webhook payload.
+// Returns the first matching rule, or nil if no rules matched.
+func matchRuleLocally(rules []ForwardRule, payload WebhookPayload) *ForwardRule {
+	if len(rules) == 0 {
+		return nil
+	}
+
+	// Parse JSON body once if possible
+	var parsedBody map[string]interface{}
+	if len(payload.Body) > 0 {
+		_ = json.Unmarshal(payload.Body, &parsedBody)
+	}
+
+	for _, rule := range rules {
+		if !rule.Active {
+			continue
+		}
+		if rule.ConditionKey == nil || strings.TrimSpace(*rule.ConditionKey) == "" {
+			continue
+		}
+
+		condKey := strings.TrimSpace(*rule.ConditionKey)
+		paramType := ""
+		if rule.ParameterType != nil {
+			paramType = strings.ToUpper(strings.TrimSpace(*rule.ParameterType))
+		}
+
+		var (
+			actualVal interface{}
+			found     bool
+		)
+
+		switch paramType {
+		case "QUERY_PARAMS", "QUERY":
+			val, ok := payload.Query[condKey]
+			if ok {
+				actualVal = val
+				found = true
+			}
+		case "BODY":
+			if parsedBody != nil {
+				actualVal, found = getNestedValue(parsedBody, condKey)
+			}
+		default:
+			// Search both body and query params
+			if parsedBody != nil {
+				actualVal, found = getNestedValue(parsedBody, condKey)
+			}
+			if !found {
+				val, ok := payload.Query[condKey]
+				if ok {
+					actualVal = val
+					found = true
+				}
+			}
+		}
+
+		if !found {
+			continue
+		}
+
+		if evaluateCondition(actualVal, rule.ConditionValue, rule.ConditionSeperator) {
+			r := rule
+			return &r
+		}
+	}
+
+	return nil
+}
+
+// getNestedValue retrieves a key using dot notation (e.g., "data.customer.id")
+func getNestedValue(data interface{}, path string) (interface{}, bool) {
+	if data == nil || path == "" {
+		return nil, false
+	}
+	parts := strings.Split(path, ".")
+	var current interface{} = data
+
+	for _, part := range parts {
+		m, ok := current.(map[string]interface{})
+		if !ok {
+			return nil, false
+		}
+		val, exists := m[part]
+		if !exists {
+			return nil, false
+		}
+		current = val
+	}
+	return current, true
+}
+
+// evaluateCondition evaluates whether the extracted value satisfies the rule condition
+func evaluateCondition(actual interface{}, expected *string, separator *string) bool {
+	if expected == nil {
+		return actual == nil
+	}
+	expectedStr := *expected
+	sep := ""
+	if separator != nil {
+		sep = strings.TrimSpace(*separator)
+	}
+
+	// Case: contains operator
+	if strings.EqualFold(sep, "contains") {
+		if actual == nil {
+			return false
+		}
+		if arr, ok := actual.([]interface{}); ok {
+			for _, item := range arr {
+				if fmt.Sprintf("%v", item) == expectedStr {
+					return true
+				}
+			}
+			return false
+		}
+		return strings.Contains(fmt.Sprintf("%v", actual), expectedStr)
+	}
+
+	// Case: delimiter separation (e.g. ",", "|", ";")
+	if sep != "" && sep != "=" && sep != "==" {
+		if strVal, ok := actual.(string); ok {
+			items := strings.Split(strVal, sep)
+			for _, it := range items {
+				if strings.TrimSpace(it) == expectedStr {
+					return true
+				}
+			}
+			return false
+		}
+		if arr, ok := actual.([]interface{}); ok {
+			for _, item := range arr {
+				if fmt.Sprintf("%v", item) == expectedStr {
+					return true
+				}
+			}
+			return false
+		}
+		return false
+	}
+
+	// Case: array value comparison
+	if arr, ok := actual.([]interface{}); ok {
+		for _, item := range arr {
+			if fmt.Sprintf("%v", item) == expectedStr {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Case: boolean comparison
+	if b, ok := actual.(bool); ok {
+		if expBool, err := strconv.ParseBool(expectedStr); err == nil {
+			return b == expBool
+		}
+	}
+
+	return fmt.Sprintf("%v", actual) == expectedStr
+}
+
+func forwardLocally(serverURL, token, defaultTarget string, payload WebhookPayload, matchedRule *ForwardRule) {
+	destinationURL := defaultTarget
 	method := payload.Method
+	var ruleID *int64
+
+	if matchedRule != nil {
+		if matchedRule.URL != "" {
+			destinationURL = matchedRule.URL
+		}
+		if matchedRule.Type != "" {
+			method = matchedRule.Type
+		}
+		id := matchedRule.ID
+		ruleID = &id
+	}
+
 	if method == "" {
 		method = "POST"
 	}
 
-	req, err := http.NewRequest(method, targetURL, bytes.NewBuffer(payload.Body))
+	req, err := http.NewRequest(method, destinationURL, bytes.NewBuffer(payload.Body))
 	if err != nil {
 		log.Printf("[!] Local request construction failed: %v", err)
-		go reportDelivery(serverURL, token, payload.RequestID, "FAILED", 0, targetURL, method, "", fmt.Sprintf("Request build failed: %v", err))
+		go reportDelivery(serverURL, token, payload.RequestID, ruleID, "FAILED", 0, destinationURL, method, "", fmt.Sprintf("Request build failed: %v", err))
 		return
 	}
 
+	// Apply inbound headers
 	for k, vals := range payload.Headers {
 		if strings.EqualFold(k, "Host") || strings.EqualFold(k, "Content-Length") {
 			continue
@@ -439,13 +656,21 @@ func forwardLocally(serverURL, token, targetURL string, payload WebhookPayload, 
 			req.Header.Add(k, v)
 		}
 	}
+
+	// If matched rule has custom headers, apply them
+	if matchedRule != nil && len(matchedRule.Headers) > 0 {
+		for k, v := range matchedRule.Headers {
+			req.Header.Set(k, v)
+		}
+	}
+
 	req.Header.Set("X-ForwardTo-Relay", "forwardto-agent")
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("[!] Dispatch to %s failed: %v", targetURL, err)
-		go reportDelivery(serverURL, token, payload.RequestID, "FAILED", 0, targetURL, method, "", fmt.Sprintf("Dispatch failed: %v", err))
+		log.Printf("[!] Dispatch to %s failed: %v", destinationURL, err)
+		go reportDelivery(serverURL, token, payload.RequestID, ruleID, "FAILED", 0, destinationURL, method, "", fmt.Sprintf("Dispatch failed: %v", err))
 		return
 	}
 	defer resp.Body.Close()
@@ -462,28 +687,25 @@ func forwardLocally(serverURL, token, targetURL string, payload WebhookPayload, 
 	}
 
 	matchedNotice := ""
-	if isRuleMatched {
-		if payload.RuleID != nil {
-			matchedNotice = fmt.Sprintf(" [Rule #%d]", *payload.RuleID)
-		} else {
-			matchedNotice = " [Matched Rule]"
-		}
+	if matchedRule != nil {
+		matchedNotice = fmt.Sprintf(" [Matched Rule #%d]", matchedRule.ID)
 	} else {
 		matchedNotice = " [Default Target]"
 	}
 
-	log.Printf("[✓ DELIVERED] HTTP %d <- %s (req #%d)%s", resp.StatusCode, targetURL, payload.RequestID, matchedNotice)
+	log.Printf("[✓ DELIVERED] HTTP %d <- %s (req #%d)%s", resp.StatusCode, destinationURL, payload.RequestID, matchedNotice)
 
 	// Asynchronously notify ForwardTo of delivery receipt so user sees it in the dashboard UI
-	go reportDelivery(serverURL, token, payload.RequestID, status, resp.StatusCode, targetURL, method, respStr, "")
+	go reportDelivery(serverURL, token, payload.RequestID, ruleID, status, resp.StatusCode, destinationURL, method, respStr, "")
 }
 
-func reportDelivery(serverURL, token string, requestID int64, status string, httpStatus int, targetURL, method, respBody, errMsg string) {
+func reportDelivery(serverURL, token string, requestID int64, ruleID *int64, status string, httpStatus int, targetURL, method, respBody, errMsg string) {
 	reportEndpoint := fmt.Sprintf("%s/api/agent/delivery-report", serverURL)
 
 	payload := map[string]interface{}{
 		"token":         token,
 		"request_id":    requestID,
+		"rule_id":       ruleID,
 		"status":        status,
 		"http_status":   httpStatus,
 		"target_url":    targetURL,
